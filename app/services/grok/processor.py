@@ -140,6 +140,18 @@ class StreamProcessor(BaseProcessor):
 
                 resp = data.get("result", {}).get("response", {})
 
+                # DEBUG: 记录每帧的关键字段，便于诊断搜索信源是否出现
+                if logger.isEnabledFor(10):  # DEBUG level
+                    keys = [k for k in resp.keys() if k not in ("token", "responseId", "llmInfo")]
+                    if keys:
+                        logger.debug(f"NDJSON frame keys (excl token/id/llm): {keys}", extra={"model": self.model})
+                if resp.get("webSearchResults") or resp.get("searchResults") or resp.get("webResults"):
+                    logger.info(
+                        f"Search results detected in frame: webSearchResults={bool(resp.get('webSearchResults'))}, "
+                        f"searchResults={bool(resp.get('searchResults'))}, webResults={bool(resp.get('webResults'))}",
+                        extra={"model": self.model},
+                    )
+
                 # 元数据
                 if (llm := resp.get("llmInfo")) and not self.fingerprint:
                     self.fingerprint = llm.get("modelHash", "")
@@ -206,6 +218,7 @@ class StreamProcessor(BaseProcessor):
                 yield self._sse("</think>\n")
 
             # 流结束前输出信源
+            logger.info(f"Stream finished. citations_mode={self.citations_mode}, collected={len(self.collected_citations)}", extra={"model": self.model})
             if self.collected_citations and self.citations_mode != "disabled":
                 mode = self.citations_mode
                 if mode in ("markdown", "both"):
@@ -302,6 +315,12 @@ class CollectProcessor(BaseProcessor):
                     continue
 
                 resp = data.get("result", {}).get("response", {})
+
+                # DEBUG: 记录搜索相关字段
+                if logger.isEnabledFor(10):
+                    keys = [k for k in resp.keys() if k not in ("token", "responseId", "llmInfo")]
+                    if keys:
+                        logger.debug(f"[Collect] NDJSON frame keys: {keys}", extra={"model": self.model})
 
                 if (llm := resp.get("llmInfo")) and not fingerprint:
                     fingerprint = llm.get("modelHash", "")
