@@ -410,6 +410,11 @@ export function createOpenAiStreamFromGrokNdjson(
               continue;
             }
 
+            // 收集搜索信源（必须在 token 类型校验之前，因为搜索帧可能没有 string token）
+            if (grok.webSearchResults?.results && Array.isArray(grok.webSearchResults.results)) {
+              collectCitations(grok.webSearchResults.results, collectedCitations, seenCitationUrls);
+            }
+
             // Text chat stream
             if (Array.isArray(rawToken)) continue;
             if (typeof rawToken !== "string" || !rawToken) continue;
@@ -423,9 +428,6 @@ export function createOpenAiStreamFromGrokNdjson(
             if (thinkingFinished && currentIsThinking) continue;
 
             if (grok.toolUsageCardId && grok.webSearchResults?.results && Array.isArray(grok.webSearchResults.results)) {
-              // 收集信源（所有模式下都收集，后续按配置决定是否输出）
-              collectCitations(grok.webSearchResults.results, collectedCitations, seenCitationUrls);
-
               if (currentIsThinking) {
                 if (showThinking) {
                   let appended = "";
@@ -527,7 +529,7 @@ export async function parseOpenAiFromGrokNdjson(
     if (!grok) continue;
 
     // 收集搜索信源
-    if (grok.toolUsageCardId && grok.webSearchResults?.results && Array.isArray(grok.webSearchResults.results)) {
+    if (grok.webSearchResults?.results && Array.isArray(grok.webSearchResults.results)) {
       collectCitations(grok.webSearchResults.results, collectedCitations, seenCitationUrls);
     }
 

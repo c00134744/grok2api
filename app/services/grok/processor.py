@@ -152,7 +152,7 @@ class StreamProcessor(BaseProcessor):
                     self.role_sent = True
 
                 # 收集搜索信源
-                if resp.get("toolUsageCardId") and resp.get("webSearchResults"):
+                if resp.get("webSearchResults"):
                     results = resp["webSearchResults"].get("results", [])
                     if isinstance(results, list):
                         self._collect_citations(results)
@@ -307,7 +307,7 @@ class CollectProcessor(BaseProcessor):
                     fingerprint = llm.get("modelHash", "")
 
                 # 收集搜索信源
-                if resp.get("toolUsageCardId") and resp.get("webSearchResults"):
+                if resp.get("webSearchResults"):
                     results = resp["webSearchResults"].get("results", [])
                     if isinstance(results, list):
                         self._collect_citations(results)
