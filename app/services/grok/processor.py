@@ -109,7 +109,7 @@ class BaseProcessor:
 
 class StreamProcessor(BaseProcessor):
     """流式响应处理器"""
-    
+
     def __init__(self, model: str, token: str = "", think: bool = None):
         super().__init__(model, token)
         self.response_id: Optional[str] = None
@@ -118,7 +118,10 @@ class StreamProcessor(BaseProcessor):
         self.role_sent: bool = False
         self.filter_tags = get_config("grok.filter_tags", [])
         self.image_format = get_config("app.image_format", "url")
-        
+        self.citations_mode: str = get_config("grok.citations", "annotations")
+        self.collected_citations: List[dict] = []
+        self._seen_citation_urls: set = set()
+
         if think is None:
             self.show_think = get_config("grok.thinking", False)
         else:
@@ -134,20 +137,26 @@ class StreamProcessor(BaseProcessor):
                     data = orjson.loads(line)
                 except orjson.JSONDecodeError:
                     continue
-                
+
                 resp = data.get("result", {}).get("response", {})
-                
+
                 # 元数据
                 if (llm := resp.get("llmInfo")) and not self.fingerprint:
                     self.fingerprint = llm.get("modelHash", "")
                 if rid := resp.get("responseId"):
                     self.response_id = rid
-                
+
                 # 首次发送 role
                 if not self.role_sent:
                     yield self._sse(role="assistant")
                     self.role_sent = True
-                
+
+                # 收集搜索信源
+                if resp.get("toolUsageCardId") and resp.get("webSearchResults"):
+                    results = resp["webSearchResults"].get("results", [])
+                    if isinstance(results, list):
+                        self._collect_citations(results)
+
                 # 图像生成进度
                 if img := resp.get("streamingImageGenerationResponse"):
                     if self.show_think:
@@ -158,7 +167,7 @@ class StreamProcessor(BaseProcessor):
                         progress = img.get('progress', 0)
                         yield self._sse(f"正在生成第{idx}张图片中，当前进度{progress}%\n")
                     continue
-                
+
                 # modelResponse
                 if mr := resp.get("modelResponse"):
                     if self.think_opened and self.show_think:
@@ -166,12 +175,12 @@ class StreamProcessor(BaseProcessor):
                             yield self._sse(msg + "\n")
                         yield self._sse("</think>\n")
                         self.think_opened = False
-                    
+
                     # 处理生成的图片
                     for url in mr.get("generatedImageUrls", []):
                         parts = url.split("/")
                         img_id = parts[-2] if len(parts) >= 2 else "image"
-                        
+
                         if self.image_format == "base64":
                             dl_service = self._get_dl()
                             base64_data = await dl_service.to_base64(url, self.token, "image")
@@ -183,18 +192,27 @@ class StreamProcessor(BaseProcessor):
                         else:
                             final_url = await self.process_url(url, "image")
                             yield self._sse(f"![{img_id}]({final_url})\n")
-                    
+
                     if (meta := mr.get("metadata", {})).get("llm_info", {}).get("modelHash"):
                         self.fingerprint = meta["llm_info"]["modelHash"]
                     continue
-                
+
                 # 普通 token
                 if (token := resp.get("token")) is not None:
                     if token and not (self.filter_tags and any(t in token for t in self.filter_tags)):
                         yield self._sse(token)
-                        
+
             if self.think_opened:
                 yield self._sse("</think>\n")
+
+            # 流结束前输出信源
+            if self.collected_citations and self.citations_mode != "disabled":
+                mode = self.citations_mode
+                if mode in ("markdown", "both"):
+                    yield self._sse(self._build_citations_markdown())
+                if mode in ("annotations", "both"):
+                    yield self._sse_with_annotations()
+
             yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
         except Exception as e:
@@ -203,20 +221,77 @@ class StreamProcessor(BaseProcessor):
         finally:
             await self.close()
 
+    def _collect_citations(self, results: list):
+        """收集搜索信源，基于 URL 去重"""
+        for r in results:
+            url = r.get("url", "")
+            if not url or not isinstance(url, str):
+                continue
+            if url in self._seen_citation_urls:
+                continue
+            self._seen_citation_urls.add(url)
+            self.collected_citations.append({
+                "title": str(r.get("title", "")),
+                "url": url,
+                "preview": str(r.get("preview", "")),
+            })
+
+    def _build_citations_markdown(self) -> str:
+        """构建 markdown 格式的信源列表"""
+        lines = ["\n\n---\n**Sources:**"]
+        for c in self.collected_citations:
+            preview = c["preview"].replace("\n", " ").strip()
+            if preview:
+                lines.append(f'- [{c["title"]}]({c["url"]}) - {preview}')
+            else:
+                lines.append(f'- [{c["title"]}]({c["url"]})')
+        lines.append("")
+        return "\n".join(lines)
+
+    def _sse_with_annotations(self) -> str:
+        """构建带 annotations 的 SSE chunk"""
+        annotations = []
+        for c in self.collected_citations:
+            annotations.append({
+                "type": "url_citation",
+                "url": c["url"],
+                "title": c["title"],
+                "start_index": 0,
+                "end_index": 0,
+            })
+
+        chunk = {
+            "id": self.response_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "system_fingerprint": self.fingerprint,
+            "choices": [{
+                "index": 0,
+                "delta": {"annotations": annotations},
+                "logprobs": None,
+                "finish_reason": None,
+            }]
+        }
+        return f"data: {orjson.dumps(chunk).decode()}\n\n"
+
 
 class CollectProcessor(BaseProcessor):
     """非流式响应处理器"""
-    
+
     def __init__(self, model: str, token: str = ""):
         super().__init__(model, token)
         self.image_format = get_config("app.image_format", "url")
-    
+        self.citations_mode: str = get_config("grok.citations", "annotations")
+        self.collected_citations: List[dict] = []
+        self._seen_citation_urls: set = set()
+
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
         """处理并收集完整响应"""
         response_id = ""
         fingerprint = ""
         content = ""
-        
+
         try:
             async for line in response:
                 if not line:
@@ -225,22 +300,28 @@ class CollectProcessor(BaseProcessor):
                     data = orjson.loads(line)
                 except orjson.JSONDecodeError:
                     continue
-                
+
                 resp = data.get("result", {}).get("response", {})
-                
+
                 if (llm := resp.get("llmInfo")) and not fingerprint:
                     fingerprint = llm.get("modelHash", "")
-                
+
+                # 收集搜索信源
+                if resp.get("toolUsageCardId") and resp.get("webSearchResults"):
+                    results = resp["webSearchResults"].get("results", [])
+                    if isinstance(results, list):
+                        self._collect_citations(results)
+
                 if mr := resp.get("modelResponse"):
                     response_id = mr.get("responseId", "")
                     content = mr.get("message", "")
-                    
+
                     if urls := mr.get("generatedImageUrls"):
                         content += "\n"
                         for url in urls:
                             parts = url.split("/")
                             img_id = parts[-2] if len(parts) >= 2 else "image"
-                            
+
                             if self.image_format == "base64":
                                 dl_service = self._get_dl()
                                 base64_data = await dl_service.to_base64(url, self.token, "image")
@@ -252,15 +333,31 @@ class CollectProcessor(BaseProcessor):
                             else:
                                 final_url = await self.process_url(url, "image")
                                 content += f"![{img_id}]({final_url})\n"
-                    
+
                     if (meta := mr.get("metadata", {})).get("llm_info", {}).get("modelHash"):
                         fingerprint = meta["llm_info"]["modelHash"]
-                            
+
         except Exception as e:
             logger.error(f"Collect processing error: {e}", extra={"model": self.model})
         finally:
             await self.close()
-        
+
+        # 构建 annotations 和 markdown
+        annotations = []
+        if self.collected_citations and self.citations_mode != "disabled":
+            mode = self.citations_mode
+            if mode in ("annotations", "both"):
+                for c in self.collected_citations:
+                    annotations.append({
+                        "type": "url_citation",
+                        "url": c["url"],
+                        "title": c["title"],
+                        "start_index": 0,
+                        "end_index": 0,
+                    })
+            if mode in ("markdown", "both"):
+                content += self._build_citations_markdown()
+
         return {
             "id": response_id,
             "object": "chat.completion",
@@ -269,7 +366,7 @@ class CollectProcessor(BaseProcessor):
             "system_fingerprint": fingerprint,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": content, "refusal": None, "annotations": []},
+                "message": {"role": "assistant", "content": content, "refusal": None, "annotations": annotations},
                 "finish_reason": "stop"
             }],
             "usage": {
@@ -278,6 +375,33 @@ class CollectProcessor(BaseProcessor):
                 "completion_tokens_details": {"text_tokens": 0, "audio_tokens": 0, "reasoning_tokens": 0}
             }
         }
+
+    def _collect_citations(self, results: list):
+        """收集搜索信源，基于 URL 去重"""
+        for r in results:
+            url = r.get("url", "")
+            if not url or not isinstance(url, str):
+                continue
+            if url in self._seen_citation_urls:
+                continue
+            self._seen_citation_urls.add(url)
+            self.collected_citations.append({
+                "title": str(r.get("title", "")),
+                "url": url,
+                "preview": str(r.get("preview", "")),
+            })
+
+    def _build_citations_markdown(self) -> str:
+        """构建 markdown 格式的信源列表"""
+        lines = ["\n\n---\n**Sources:**"]
+        for c in self.collected_citations:
+            preview = c["preview"].replace("\n", " ").strip()
+            if preview:
+                lines.append(f'- [{c["title"]}]({c["url"]}) - {preview}')
+            else:
+                lines.append(f'- [{c["title"]}]({c["url"]})')
+        lines.append("")
+        return "\n".join(lines)
 
 
 class VideoStreamProcessor(BaseProcessor):

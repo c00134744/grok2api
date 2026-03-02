@@ -273,6 +273,7 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         image_generation_method: normalizeImageGenerationMethod(
           settings.grok.image_generation_method,
         ),
+        citations: String(settings.grok.citations ?? "annotations"),
       },
       token: {
         auto_refresh: Boolean(settings.token.auto_refresh),
@@ -343,6 +344,12 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
         grok_config.image_generation_method = normalizeImageGenerationMethod(
           grokCfg.image_generation_method,
         );
+      }
+      if (typeof grokCfg.citations === "string") {
+        const c = grokCfg.citations.trim().toLowerCase();
+        if (c === "disabled" || c === "annotations" || c === "markdown" || c === "both") {
+          grok_config.citations = c;
+        }
       }
     }
 

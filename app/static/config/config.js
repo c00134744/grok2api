@@ -44,7 +44,8 @@ const LOCALE_MAP = {
     "cf_clearance": { title: "CF Clearance", desc: "Cloudflare 验证 Cookie，用于验证 Cloudflare 的验证。" },
     "max_retry": { title: "最大重试", desc: "请求 Grok 服务失败时的最大重试次数。" },
     "retry_status_codes": { title: "重试状态码", desc: "触发重试的 HTTP 状态码列表。" },
-    "image_generation_method": { title: "生图调用方式", desc: "旧方法稳定；新方法为实验性方法。" }
+    "image_generation_method": { title: "生图调用方式", desc: "旧方法稳定；新方法为实验性方法。" },
+    "citations": { title: "搜索信源", desc: "搜索结果引用返回方式：disabled 不返回 / annotations 以结构化标注返回（默认） / markdown 追加到内容末尾 / both 同时返回。" }
   },
   "token": {
     "label": "Token 池设置",
@@ -239,6 +240,28 @@ function renderConfig(data) {
         const opts = [
           { val: 'legacy', text: '旧方法（默认）' },
           { val: 'imagine_ws_experimental', text: '新方法（实验性）' }
+        ];
+
+        opts.forEach(opt => {
+          const option = document.createElement('option');
+          option.value = opt.val;
+          option.text = opt.text;
+          if (val === opt.val) option.selected = true;
+          input.appendChild(option);
+        });
+        inputWrapper.appendChild(input);
+      }
+      else if (key === 'citations') {
+        input = document.createElement('select');
+        input.className = 'geist-input h-[34px]';
+        input.dataset.section = section;
+        input.dataset.key = key;
+
+        const opts = [
+          { val: 'annotations', text: 'Annotations（默认）' },
+          { val: 'markdown', text: 'Markdown' },
+          { val: 'both', text: '两者都返回' },
+          { val: 'disabled', text: '不返回' }
         ];
 
         opts.forEach(opt => {

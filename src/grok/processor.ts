@@ -44,6 +44,81 @@ function makeDone(): string {
   return "data: [DONE]\n\n";
 }
 
+interface CitationEntry {
+  title: string;
+  url: string;
+  preview: string;
+}
+
+function collectCitations(
+  results: unknown[],
+  collected: CitationEntry[],
+  seenUrls: Set<string>,
+): void {
+  for (const r of results) {
+    if (!r || typeof r !== "object") continue;
+    const rec = r as Record<string, unknown>;
+    const url = typeof rec.url === "string" ? rec.url : "";
+    if (!url || seenUrls.has(url)) continue;
+    seenUrls.add(url);
+    collected.push({
+      title: typeof rec.title === "string" ? rec.title : "",
+      url,
+      preview: typeof rec.preview === "string" ? rec.preview : "",
+    });
+  }
+}
+
+function makeAnnotationsChunk(
+  id: string,
+  created: number,
+  model: string,
+  citations: CitationEntry[],
+): string {
+  const annotations = citations.map((c) => ({
+    type: "url_citation",
+    url: c.url,
+    title: c.title,
+    start_index: 0,
+    end_index: 0,
+  }));
+  const payload: Record<string, unknown> = {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: { annotations },
+        logprobs: null,
+        finish_reason: null,
+      },
+    ],
+  };
+  return `data: ${JSON.stringify(payload)}\n\n`;
+}
+
+function buildCitationsMarkdown(citations: CitationEntry[]): string {
+  const lines = ["\n\n---\n**Sources:**"];
+  for (const c of citations) {
+    const preview = c.preview.replace(/\n/g, " ").trim();
+    if (preview) {
+      lines.push(`- [${c.title}](${c.url}) - ${preview}`);
+    } else {
+      lines.push(`- [${c.title}](${c.url})`);
+    }
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+function normalizeCitationsMode(value: unknown): "disabled" | "annotations" | "markdown" | "both" {
+  const s = String(value ?? "").trim().toLowerCase();
+  if (s === "disabled" || s === "annotations" || s === "markdown" || s === "both") return s;
+  return "annotations";
+}
+
 function toImgProxyUrl(globalCfg: GlobalSettings, origin: string, path: string): string {
   const baseUrl = (globalCfg.base_url ?? "").trim() || origin;
   return `${baseUrl}/images/${path}`;
@@ -141,6 +216,9 @@ export function createOpenAiStreamFromGrokNdjson(
     .map((t) => t.trim())
     .filter(Boolean);
   const showThinking = settings.show_thinking !== false;
+  const citationsMode = normalizeCitationsMode(settings.citations);
+  const collectedCitations: CitationEntry[] = [];
+  const seenCitationUrls = new Set<string>();
 
   const firstTimeoutMs = Math.max(0, (settings.stream_first_response_timeout ?? 30) * 1000);
   const chunkTimeoutMs = Math.max(0, (settings.stream_chunk_timeout ?? 120) * 1000);
@@ -345,6 +423,9 @@ export function createOpenAiStreamFromGrokNdjson(
             if (thinkingFinished && currentIsThinking) continue;
 
             if (grok.toolUsageCardId && grok.webSearchResults?.results && Array.isArray(grok.webSearchResults.results)) {
+              // 收集信源（所有模式下都收集，后续按配置决定是否输出）
+              collectCitations(grok.webSearchResults.results, collectedCitations, seenCitationUrls);
+
               if (currentIsThinking) {
                 if (showThinking) {
                   let appended = "";
@@ -382,6 +463,16 @@ export function createOpenAiStreamFromGrokNdjson(
           }
         }
 
+        // 流结束前输出信源
+        if (collectedCitations.length > 0 && citationsMode !== "disabled") {
+          if (citationsMode === "markdown" || citationsMode === "both") {
+            controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, buildCitationsMarkdown(collectedCitations))));
+          }
+          if (citationsMode === "annotations" || citationsMode === "both") {
+            controller.enqueue(encoder.encode(makeAnnotationsChunk(id, created, currentModel, collectedCitations)));
+          }
+        }
+
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
         if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
@@ -415,6 +506,10 @@ export async function parseOpenAiFromGrokNdjson(
   const text = await grokResp.text();
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
 
+  const citationsMode = normalizeCitationsMode(settings.citations);
+  const collectedCitations: CitationEntry[] = [];
+  const seenCitationUrls = new Set<string>();
+
   let content = "";
   let model = requestedModel;
   for (const line of lines) {
@@ -430,6 +525,11 @@ export async function parseOpenAiFromGrokNdjson(
 
     const grok = (data as any).result?.response;
     if (!grok) continue;
+
+    // 收集搜索信源
+    if (grok.toolUsageCardId && grok.webSearchResults?.results && Array.isArray(grok.webSearchResults.results)) {
+      collectCitations(grok.webSearchResults.results, collectedCitations, seenCitationUrls);
+    }
 
     const videoResp = grok.streamingVideoGenerationResponse;
     if (videoResp?.videoUrl && typeof videoResp.videoUrl === "string") {
@@ -476,6 +576,25 @@ export async function parseOpenAiFromGrokNdjson(
     break;
   }
 
+  // 构建 annotations 和 markdown
+  const annotations: Record<string, unknown>[] = [];
+  if (collectedCitations.length > 0 && citationsMode !== "disabled") {
+    if (citationsMode === "annotations" || citationsMode === "both") {
+      for (const c of collectedCitations) {
+        annotations.push({
+          type: "url_citation",
+          url: c.url,
+          title: c.title,
+          start_index: 0,
+          end_index: 0,
+        });
+      }
+    }
+    if (citationsMode === "markdown" || citationsMode === "both") {
+      content += buildCitationsMarkdown(collectedCitations);
+    }
+  }
+
   return {
     id: `chatcmpl-${crypto.randomUUID()}`,
     object: "chat.completion",
@@ -484,7 +603,7 @@ export async function parseOpenAiFromGrokNdjson(
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content },
+        message: { role: "assistant", content, annotations },
         finish_reason: "stop",
       },
     ],
